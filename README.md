@@ -49,12 +49,6 @@ The request follows the AlphaFold3 json input, with `protein`, `dna`, `rna` and 
 
 Modification positions start at 1, as in AlphaFold3.
 
-### Seeds
-
-`--random_seed N --num_seeds K` predicts seeds `N, N+1, ..., N+K-1` (a random `N` if not given), `--seeds 3,7,11` gives
-them explicitly. Seeds are limited to 0..2^31-1 (RDKit seeds the conformers of SMILES ligands with them). The model is
-loaded once and each seed produces `--num_diffusion_samples` predictions.
-
 ### MSAs
 
 `--msa_source` selects the tool that computed the alignments in `--msa_dir`:
@@ -79,12 +73,3 @@ For each seed `S` and sample `K`, in `--output_dir`:
 - `esmf2_seed_S_sample_K_summary_confidences.json`: mean `plddt`, `ptm`, `iptm`, `chain_pair_iptm` and `chain_ids`.
 
 The log gives `Seed S predict time <x>s` for each seed.
-
-## Tests
-
-The tests run on CPU and do not need the weights:
-
-```bash
-pip install pytest
-pytest tests
-```
