@@ -52,7 +52,8 @@ Modification positions start at 1, as in AlphaFold3.
 ### Seeds
 
 `--random_seed N --num_seeds K` predicts seeds `N, N+1, ..., N+K-1` (a random `N` if not given), `--seeds 3,7,11` gives
-them explicitly. The model is loaded once and each seed produces `--num_diffusion_samples` predictions.
+them explicitly. Seeds are limited to 0..2^31-1 (RDKit seeds the conformers of SMILES ligands with them). The model is
+loaded once and each seed produces `--num_diffusion_samples` predictions.
 
 ### MSAs
 

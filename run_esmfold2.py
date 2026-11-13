@@ -31,6 +31,8 @@ import time
 import numpy as np
 
 ENTITY_TYPES = ("protein", "dna", "rna", "ligand")
+# RDKit conformer generation of SMILES ligands takes a signed 32 bits seed
+MAX_SEED = 2**31 - 1
 MSA_SOURCES = ("none", "afmassive", "colabfold", "alphafold3")
 
 parser = argparse.ArgumentParser(description="Run ESMFold2 predictions on a batch of seeds")
@@ -114,9 +116,13 @@ def build_input(request, msas):
 
 def resolve_seeds(args):
     if args.seeds:
-        return [int(seed) for seed in args.seeds.split(",") if seed.strip()]
-    first_seed = args.random_seed if args.random_seed is not None else random.randint(0, 4_000_000_000)
-    return [first_seed + i for i in range(args.num_seeds)]
+        seeds = [int(seed) for seed in args.seeds.split(",") if seed.strip()]
+    else:
+        first_seed = args.random_seed if args.random_seed is not None else random.randint(0, MAX_SEED - args.num_seeds)
+        seeds = [first_seed + i for i in range(args.num_seeds)]
+    if any(seed < 0 or seed > MAX_SEED for seed in seeds):
+        raise ValueError(f"Seeds should be between 0 and {MAX_SEED}, got {seeds}")
+    return seeds
 
 # rows sharing a 'key=N' header token are paired across chains by ESMFold2 (esm/models/esmfold2/paired_msa.py)
 KEY_PATTERN = re.compile(r"key=(-?\d+)")
