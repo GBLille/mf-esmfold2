@@ -33,9 +33,6 @@ import numpy as np
 ENTITY_TYPES = ("protein", "dna", "rna", "ligand")
 MSA_SOURCES = ("none", "afmassive", "colabfold", "alphafold3")
 
-# ==========================================
-# 0. ARGUMENTS
-# ==========================================
 parser = argparse.ArgumentParser(description="Run ESMFold2 predictions on a batch of seeds")
 parser.add_argument("--json_path", type=str, required=True, help="Path to the json request (see the module docstring)")
 parser.add_argument("--output_dir", type=str, required=True, help="Directory where the predictions are written")
@@ -55,9 +52,6 @@ parser.add_argument("--msa_max_depth", type=int, default=1024, help="Maximum MSA
 parser.add_argument("--model", type=str, default="biohub/ESMFold2", help="Hugging Face name or local path of the model")
 parser.add_argument("--device", type=str, default="cuda", help="Torch device used for the predictions")
 
-# ==========================================
-# 1. INPUT
-# ==========================================
 def load_request(json_path):
     with open(json_path, "r") as f:
         request = json.load(f)
@@ -124,15 +118,8 @@ def resolve_seeds(args):
     first_seed = args.random_seed if args.random_seed is not None else random.randint(0, 4_000_000_000)
     return [first_seed + i for i in range(args.num_seeds)]
 
-# ==========================================
-# 2. MSAS
-# ==========================================
 # rows sharing a 'key=N' header token are paired across chains by ESMFold2 (esm/models/esmfold2/paired_msa.py)
 KEY_PATTERN = re.compile(r"key=(-?\d+)")
-# same species extraction as AlphaFold2 multimer (alphafold/data/msa_identifiers.py)
-UNIPROT_PATTERN = re.compile(
-    r"^(?:tr|sp)\|(?:[A-Z0-9]{6,10})(?:_\d+)?\|(?:[A-Z0-9]{1,10}_)(?P<SpeciesIdentifier>[A-Z0-9]{1,5})")
-
 def with_headers(msa, headers):
     from esm.utils.msa.msa import MSA
     from esm.utils.parsing import FastaEntry
@@ -168,13 +155,14 @@ def afmassive_msa_dirs(msa_dir, sequences):
     return sequence_dirs
 
 def species_keyed(msa, species_keys):
+    # same species extraction as AFmassive multimer pairing
+    from alphafold.data.msa_identifiers import get_identifiers
     headers = []
     for i, entry in enumerate(msa.entries):
-        match = UNIPROT_PATTERN.match(entry.header.strip())
-        if i == 0 or not match:
+        species = get_identifiers(entry.header).species_id
+        if i == 0 or not species:
             headers.append(KEY_PATTERN.sub("nokey", entry.header))
             continue
-        species = match.group("SpeciesIdentifier")
         key = species_keys.setdefault(species, len(species_keys) + 1)
         headers.append(f"{KEY_PATTERN.sub('nokey', entry.header)} key={key}")
     return with_headers(msa, headers)
@@ -203,6 +191,168 @@ def read_afmassive_msas(msa_dir, sequences, max_sequences):
         msas[sequence] = stack(parts)
     return msas
 
+def row_keyed(msa, offset=0):
+    """Key each row by its index: row i of each chain is paired with row i of the others."""
+    headers = [ entry.header if i == 0 else f"{KEY_PATTERN.sub('nokey', entry.header)} key={offset + i}"
+                for i, entry in enumerate(msa.entries) ]
+    return with_headers(msa, headers)
+
+def a3m_text_to_msa(a3m_text, max_sequences):
+    from esm.utils.msa.msa import MSA
+    if not a3m_text or not a3m_text.strip():
+        return None
+    return MSA.from_a3m(io.StringIO(a3m_text), remove_insertions=True, max_sequences=max_sequences)
+
+def read_alphafold3_msas(msa_dir, sequences, max_sequences):
+    """Alignments of the AlphaFold3 data pipeline (msas_alphafold3_data.json)."""
+    data_json = msa_dir if os.path.isfile(msa_dir) else os.path.join(msa_dir, "msas_alphafold3_data.json")
+    with open(data_json, "r") as f:
+        data = json.load(f)
+
+    def msa_text(protein, key):
+        # inline a3m, or a path once lightened by MassiveFold
+        if protein.get(key):
+            return protein[key]
+        path = protein.get(f"{key}Path")
+        if path and os.path.isfile(path):
+            with open(path, "r") as f:
+                return f.read()
+        return ""
+
+    msas = {}
+    for entry in data["sequences"]:
+        entity, protein = entity_of(entry)
+        if entity != "protein" or protein["sequence"] not in sequences:
+            continue
+        paired = a3m_text_to_msa(msa_text(protein, "pairedMsa"), max_sequences)
+        unpaired_msa = a3m_text_to_msa(msa_text(protein, "unpairedMsa"), max_sequences)
+        msas[protein["sequence"]] = stack([
+            row_keyed(paired) if paired is not None else None,
+            unpaired(unpaired_msa) if unpaired_msa is not None else None,
+        ])
+    return msas
+
+def normalize_a3m(lines):
+    """Copy of colabfold.batch.normalize_a3m, colabfold 1.6.3."""
+    out = []
+    i = 0
+    # keep meta header
+    if lines and lines[0].startswith("#"):
+        out.append(lines[0].rstrip("\n"))
+        i = 1
+    header = None
+    seq_chunks = []
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line:
+            continue
+        if line.startswith(">"):
+            if header is not None:
+                out.append(header)
+                out.append("".join(seq_chunks))
+            header = line
+            seq_chunks = []
+        else:
+            # remove all whitespace inside sequence lines
+            seq_chunks.append("".join(line.split()))
+    if header is not None:
+        out.append(header)
+        out.append("".join(seq_chunks))
+    return out
+
+def split_colabfold_a3m(a3m_text):
+    """Port of colabfold.batch.unserialize_msa, colabfold 1.6.3.
+    A multimer a3m starts with '#len1,len2<TAB>card1,card2', rows with residues in several chains 
+    are paired, the others are unpaired rows of their chain. As ESMFold2 folds homo-oligomers from 
+    the unpaired MSA, no paired block of query copies is made.
+    """
+    lines = normalize_a3m(a3m_text.replace("\x00", "").splitlines())
+    if not lines[0].startswith("#") or len(lines[0][1:].split("\t")) != 2:
+        query = lines[1] if lines[0].startswith(">") else lines[0]
+        return {query: ("", "\n".join(lines) + "\n")}
+
+    lengths_field, cardinality_field = lines[0][1:].split("\t")
+    lengths = [ int(length) for length in lengths_field.split(",") ]
+    cardinalities = [ int(cardinality) for cardinality in cardinality_field.split(",") ]
+    num_chains = len(lengths)
+    is_single_protein = num_chains == 1 and cardinalities[0] == 1
+    is_homooligomer = num_chains == 1 and cardinalities[0] > 1
+
+    queries = []
+    start = 0
+    for length in lengths:
+        queries.append(lines[2][start:start + length])
+        start += length
+
+    def split_by_alignment(sequence):
+        segments, has_residues = [], []
+        start, aligned, residues = 0, 0, False
+        for i, residue in enumerate(sequence):
+            if residue.islower():
+                continue
+            residues = residues or (residue != "-" and residue.isupper())
+            aligned += 1
+            if aligned == lengths[len(segments)]:
+                segments.append(sequence[start:i + 1])
+                has_residues.append(residues)
+                start, aligned, residues = i + 1, 0, False
+                if len(segments) == num_chains:
+                    break
+        return segments, has_residues
+
+    paired = [ [] for _ in range(num_chains) ]
+    unpaired_rows = [ [] for _ in range(num_chains) ]
+    seen = set()
+    for i in range(1, len(lines) - 1, 2):
+        header, sequence = lines[i], lines[i + 1]
+        if (header, sequence) in seen:
+            continue
+        seen.add((header, sequence))
+        segments, has_residues = split_by_alignment(sequence)
+        if len(segments) != num_chains:
+            continue
+        if not is_single_protein and not is_homooligomer and sum(has_residues) > 1:
+            labels = header.lstrip(">").split("\t")
+            for j, segment in enumerate(segments):
+                paired[j].append(f">{labels[min(j, len(labels) - 1)]}\n{segment}\n")
+        else:
+            for j, segment in enumerate(segments):
+                if has_residues[j]:
+                    unpaired_rows[j].append(f"{header}\n{segment}\n")
+
+    chains = {}
+    for j, query in enumerate(queries):
+        # each chain's MSA starts with its query
+        unpaired_text = "".join(unpaired_rows[j])
+        if not unpaired_text.startswith(f">") or unpaired_text.split("\n")[1] != query:
+            unpaired_text = f">query\n{query}\n" + unpaired_text
+        chains[query] = ("".join(paired[j]), unpaired_text)
+    return chains
+
+def read_colabfold_msas(msa_dir, sequences, max_sequences):
+    """Alignments of colabfold_search (one a3m per job in msas_colabfold)."""
+    a3m_files = [msa_dir] if os.path.isfile(msa_dir) else sorted(
+        os.path.join(msa_dir, name) for name in os.listdir(msa_dir) if name.endswith(".a3m"))
+    msas = {}
+    for a3m_file in a3m_files:
+        with open(a3m_file, "r") as f:
+            chains = split_colabfold_a3m(f.read())
+        # the a3m of the job is the one aligning all the requested sequences
+        if not set(sequences) <= set(chains):
+            continue
+        for sequence in sequences:
+            paired_text, unpaired_text = chains[sequence]
+            paired = a3m_text_to_msa(paired_text, max_sequences)
+            unpaired_msa = a3m_text_to_msa(unpaired_text, max_sequences)
+            msas[sequence] = stack([
+                unpaired(unpaired_msa) if unpaired_msa is not None else None,
+                # the query row of the paired block is dropped by the stacking
+                row_keyed(paired) if paired is not None else None,
+            ])
+        break
+    return msas
+
 def read_msas(source, msa_dir, sequences, max_sequences):
     """Return {protein sequence: MSA} for the sequences found in the alignments of the source."""
     if source == "none" or not sequences:
@@ -211,6 +361,8 @@ def read_msas(source, msa_dir, sequences, max_sequences):
         raise FileNotFoundError(f"MSA source '{source}' given but --msa_dir '{msa_dir}' does not exist")
     readers = {
         "afmassive": read_afmassive_msas,
+        "alphafold3": read_alphafold3_msas,
+        "colabfold": read_colabfold_msas,
     }
     msas = readers[source](msa_dir, sequences, max_sequences)
     checked = {}
@@ -223,45 +375,11 @@ def read_msas(source, msa_dir, sequences, max_sequences):
         checked[sequence] = msa
     return checked
 
-# ==========================================
-# 3. OUTPUT
-# ==========================================
-def add_atom_site_occupancy(mmcif_text, occupancy="1.00"):
-    """Add _atom_site.occupancy (needed by Biopython's MMCIFParser) to the atom rows when it is missing."""
-    lines = mmcif_text.splitlines()
-    output_lines = []
-    i = 0
-    while i < len(lines):
-        if lines[i].strip() != "loop_":
-            output_lines.append(lines[i])
-            i += 1
-            continue
-        output_lines.append(lines[i])
-        i += 1
-        tags = []
-        while i < len(lines) and lines[i].strip().startswith("_"):
-            tags.append(lines[i].strip().split()[0])
-            output_lines.append(lines[i])
-            i += 1
-        if not any(tag.startswith("_atom_site.") for tag in tags) or "_atom_site.occupancy" in tags:
-            continue
-        output_lines.append("_atom_site.occupancy")
-        while i < len(lines):
-            stripped = lines[i].strip()
-            if stripped in ("", "#", "loop_") or stripped.startswith(("data_", "save_", "_")):
-                break
-            output_lines.append(f"{lines[i]} {occupancy}")
-            i += 1
-    return "\n".join(output_lines) + "\n"
-
 def write_sample(result, seed, sample, output_dir, chains):
     name = f"esmf2_seed_{seed}_sample_{sample}"
 
-    mmcif = result.complex.to_mmcif()
-    if "_atom_site.occupancy" not in mmcif:
-        mmcif = add_atom_site_occupancy(mmcif)
     with open(os.path.join(output_dir, f"{name}.cif"), "w") as f:
-        f.write(mmcif)
+        f.write(result.complex.to_mmcif())
 
     plddt = result.plddt.float().numpy() * 100
     pae = result.pae.float().numpy()
@@ -289,9 +407,6 @@ def write_sample(result, seed, sample, output_dir, chains):
 def all_chain_ids(request):
     return [ chain for entry in request["sequences"] for chain in chain_ids(entity_of(entry)[1]) ]
 
-# ==========================================
-# 4. MAIN
-# ==========================================
 def main(argv=None):
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
